@@ -1,0 +1,302 @@
+% =========================================================================
+% Kontinuierlich relaxierte Version des stochastischen Unit-Commitment,
+% damit YALMIP klassische Dualvariablen berechnen kann.
+% =========================================================================
+
+clearvars
+clc
+
+%% Inputs
+load('ScenarioTree24h.mat')  % Lädt u.a. quantiles_flip, wind_error, prob, time_steps
+
+
+
+Demand = [264156 275614 280571 285170 288247 286338 285496 279137] %Stündliches Lastprofi
+           % Zeitreihe der Stromnachfrage
+VOLL = 90;                       % Value of Lost Load (€/MWh)
+Wind_forecast = [88906 90767 90051 90272 88382 86957 88011 94556]% Prognose Windenergie (MW)
+Wind_capacity = 60000;             % Maximale Produktionskapazität (MW)
+
+InputData.H_const_Wind = 0; % Trägheitskonstante Windkraftanlage
+
+num_gen = 3; % Anzahl der Generatoren sind
+
+InputData.num_gen = [1;1;1]; % Die Kraftwerkstypen sind wie folgt [OCGT,CCGT, Wasserkraft]
+
+InputData.H_const       = [3; 11; 10]; % Netzanlaufzeitkonstanten der Generatoren (s)
+InputData.Td            = [3; 10; 15];   % Zeit, in der FR vollständig erreicht ist (s)
+InputData.H_const_Nuclear = 0;
+InputData.nadir_req     = 0.8;   % Eingrenzung der minimale zulässigen Frequenz 49,2 Hz
+InputData.Rocof_max     = 1;     % Max zulässige Frequenzänderungsrate (Hz/s)
+InputData.f_0           = 50;    % Netzfrequenz Sollwert (Hz)
+
+% Kosten
+c   = [250; 180; 100];  % Grenzkosten (€/MWh) siehe Merid-order Bundesnetzagentur Annahme für Zukunft mit H2
+stc = [100; 9000; 50000]; % Startkosten abhängig von Startvorgängen (€)
+
+% Erzeugungslimits der 3 Generatoren(min, max) ( Das Maximum orientiert
+% sich an der Installierten Leistung)
+InputData.Gen_limits = [ 350 25364;
+                        410 12236;
+                        7050 31200];
+
+MaxFRpercentage = [0.5; 0.5; 0.6]; % Max FR als Prozentsatz der Kapazität 1 = 100%
+
+InputData.DV_PLoss = 8000;  % Referenzstörung 3GW (MW)
+
+% Rampenlimits (MW/h) [Rdown, Rup]
+Ramp_limits = [ 3000  3000;
+                140  140;
+                100   100 ];
+
+% Anfangszustand: Ursprünglich binär => Hier als Realwert in [0,1]
+Initial_commitment = [1; 1; 1];
+
+tau = 1; % Zeitschritt = 1 Stunde
+
+%% Plausibilitätschecks
+if length(Demand)~=length(Wind_forecast)
+    error('Demand and Wind_forecast must have the same length.')
+end
+if length(Demand)~=time_steps
+    error('Vector Demand must be the same length as time_steps in scenario_tree.')
+end
+
+%% Wind-Szenariobaum erstellen
+Wind_tree = []; % Matrix mit stochastischer Windmenge und allen Zeitschritten und Szenarien
+for k=1:time_steps
+    Wind_tree = [Wind_tree, ...
+        Wind_forecast(k)*(1 + wind_error(:,k))];
+end
+Wind_tree(Wind_tree>Wind_capacity) = Wind_capacity;  % Begrenzen auf max. Kapazität
+
+%% Initialisieren der Constraints-Sammlungen um Nebenbedingungen zu implementieren
+Load_balance            = []; % Lastausgleichsparameter 
+Aux_constraints         = []; % Schaltzustände sowie Windabregelungen
+Constraints_Gen_limits  = []; % Grenzen der Generatorerzeugung
+Constraints_Ramp_limits = []; % Grenzen der Erzeugungsänderungen der Generatoren
+Constraints_Rocof       = []; % Sicherstellen das Systemträgheit Frequenzänderung beschränkt
+Constraints_FR          = []; % Momentanreserve
+Nadir_constraints       = []; % Frequenzssteuerung
+
+%% Zusätzliche Variablen zur Kostenberechnung
+Wind_curtailed = sdpvar(length(quantiles_flip), time_steps, 'full'); % Yalmip Variable für Windenergieabregelung
+Load_curtailed = sdpvar(length(quantiles_flip), time_steps, 'full'); % Yalmipvariable für Lastabregelung
+Cost_node      = sdpvar(length(quantiles_flip), time_steps, 'full'); % Yalmipvariable für Knotenkosten (Szenario&Zeit)
+
+%% Entscheidungsvariablen definieren und Constraints aufbauen
+for k=1:time_steps
+    for n=1:length(quantiles_flip)
+
+        % --- 1) Generator-Entscheidungsvariablen (relaxiert) ---
+        x{n,k} = sdpvar(num_gen,1);  % MW Erzeugung n= Szenario stochastisch k= Zeitschritt
+        y{n,k} = sdpvar(num_gen,1);  % Commitment in [0,1] [RELAXIERUNG  also nicht mehr rein binär aufgrund von Schattenpreis]
+        FR{n,k} = sdpvar(num_gen,1); % Frequenzreserve (MW)
+
+        startup_DV{n,k} = sdpvar(num_gen,1); % Startvariablen der Generatoren ebenfalls relaxiert
+
+        % --- 2) Die Grenzwerte in denen wir agieren
+        Bounds_temp = [ 0 <= y{n,k} <= 1, ...
+                        0 <= x{n,k} <= InputData.Gen_limits(:,2), ...
+                        0 <= FR{n,k} <= InputData.Gen_limits(:,2) ];
+        Aux_constraints = [Aux_constraints, Bounds_temp]; % Übergabe in Hauptbedingungen
+
+        % Anfangszustand am k=1 => y(1) = Initial?
+        if k==1
+            Aux_constraints = [Aux_constraints, ...
+                               y{n,k} == Initial_commitment ];% Anfangszustand in 1 Zeitpunkt
+            Aux_constraints = [Aux_constraints, ...
+                               startup_DV{n,k} == y{n,k} ];
+        else
+            % startup_DV >= y(k) - y(k-1), startup_DV >= 0
+            Aux_constraints = [Aux_constraints, ...
+                               startup_DV{n,k} >= y{n,k} - y{n,k-1}, ...% Start ist wenn von 0 auf 1
+                               startup_DV{n,k} >= 0 ];
+        end
+
+        % --- 3) Wind und Last - Abschaltungen ---
+        Aux_constraints = [ Aux_constraints, ...
+            0 <= Wind_curtailed(n,k) <= Wind_tree(n,k), ...
+            0 <= Load_curtailed(n,k) <= Demand(k) ];
+
+        % --- 4) Kostenknoten ---
+        Cost_node(n,k) = stc'*startup_DV{n,k} ...
+                         + tau*( c'*x{n,k} + VOLL*Load_curtailed(n,k) );
+
+        % --- 5) Lastbilanz ---
+        Load_balance = [Load_balance, ...
+            sum(x{n,k}) + Wind_tree(n,k) - Wind_curtailed(n,k) ...
+            == Demand(k) - Load_curtailed(n,k) ];
+
+        % --- 6) Generatorgrenzen (min, max) ---
+        for i=1:num_gen
+            Constraints_Gen_limits = [ Constraints_Gen_limits, ...
+                y{n,k}(i)*InputData.Gen_limits(i,1) <= x{n,k}(i) <= y{n,k}(i)*InputData.Gen_limits(i,2) ]; % Wie Bounds von X
+        end
+
+        % --- 7) Rampenlimits Erzeugungsänderungen der Generatoren begrenzen---
+        if k==2
+            for i=1:num_gen
+                Constraints_Ramp_limits = [Constraints_Ramp_limits,...
+                   -tau*Ramp_limits(i,1)*y{n,k-1}(i) ...
+                    <= x{n,k}(i) - x{ceil(length(quantiles)/2),k-1}(i) ...
+                    <= tau*Ramp_limits(i,2)*y{n,k-1}(i)]; % Mittleres Szenario 
+            end
+        elseif k>2
+            for i=1:num_gen
+                Constraints_Ramp_limits = [Constraints_Ramp_limits,...
+                    -tau*Ramp_limits(i,1)*y{n,k-1}(i) ...
+                     <= x{n,k}(i) - x{n,k-1}(i) ...
+                     <= tau*Ramp_limits(i,2)*y{n,k-1}(i)];
+            end
+        end
+
+        % --- 8) Berechnung der totalen Trägheit (Inertia) ---
+        H_total = ...
+            ( (InputData.H_const .* y{n,k})' * InputData.Gen_limits(:,2) )/InputData.f_0 ...%offne Frage warum durch 50Hz?
+          + ( InputData.H_const_Wind*(Wind_tree(n,k) - Wind_curtailed(n,k)) )/InputData.f_0;
+
+        % --- 9) Rocof Constraint ---
+        Constraints_Rocof = [Constraints_Rocof, ...
+            H_total >= InputData.DV_PLoss/(2*InputData.Rocof_max)]; % Was ist mit Psys?
+
+        % --- 10) FR-Kapazität und Bounds ---
+        %   -> scenario-spezifisch berechnen
+        fr_capacity_nk = y{n,k}.*MaxFRpercentage.*InputData.Gen_limits(:,2);
+        Constraints_FR = [Constraints_FR, ...
+            0 <= FR{n,k} <= fr_capacity_nk ];
+
+        % Damit die Funktion "setNadir..." den richtigen FR_capacity-Wert
+        InputData.fr_capacity = fr_capacity_nk;
+
+        % --- 11) Nadir-Constraints (Aufruf setNadir...) ---
+        P_Wind_scenario = Wind_tree(n,k) - Wind_curtailed(n,k); %Tatsächliche Windenergie im System
+
+        [DV_Total_FR_atTd_out, Inertia_term_out, PLoss_term_out, FR_term_out, ...
+        Bounds_temp_out, nadirStruct] = ...
+        setNadirRealparametrierung24h(InputData, FR{n,k}, H_total, ...
+                        InputData.DV_PLoss, Bounds_temp, ...
+                        P_Wind_scenario);
+
+        allNadirStruct{n,k} = nadirStruct;  % Speichere nadirStruct für (n,k)
+
+        % Diese neu erzeugten Bounds und Constraints anhängen
+        Aux_constraints   = [Aux_constraints, Bounds_temp_out];
+        Nadir_constraints = [Nadir_constraints, nadirStruct.all];
+
+        % --- 12) QSS-Bedingung (Quasi Steady State) ---
+        % FR muss mind. so groß sein wie der Ausfall
+        qss = sum(FR{n,k}) >= InputData.DV_PLoss;
+        Constraints_FR = [Constraints_FR, qss];
+
+    end
+end
+
+%% Zielfunktion Betriebskosten minimieren
+Objective = sum(sum(prob.*Cost_node));
+
+%% Gesamte Constraints werden hier gesammelt
+Constraints = [ Aux_constraints,...
+                Load_balance,...
+                Constraints_Gen_limits,...
+                Constraints_Ramp_limits,...
+                Constraints_Rocof,...
+                Constraints_FR,...
+                Nadir_constraints 
+                ];
+
+%% Solver-Settings
+options = sdpsettings('solver','gurobi',...
+                      'verbose',1,...
+                      'gurobi.MIPGap',0.001,...
+                      'gurobi.TuneTimeLimit',0,...
+                      'gurobi.QCPDual',1,...
+                      'gurobi.BarQCPConvTol',1e-3);
+
+%% Optimierung starten
+sol = optimize(Constraints, Objective, options);
+
+if sol.problem == 0
+    disp('Optimization (Relaxed UC) finished successfully.');
+    disp(['Objective value: ', num2str(value(Objective))]);
+else
+    disp('Optimization could not be solved. Diagnostic info:');
+    sol.info
+end
+
+
+%% ========== Auslesen der Dualvariablen der Nadir-Nebenbedingungen und Mittelwertberechnung ==========
+
+% Iteriere über alle Zeitpunkte und Szenarien und speichere die Dualvariablen
+for k = 1:time_steps
+    for n = 1:length(quantiles_flip)
+        nadirStruct = allNadirStruct{n,k};
+        % Lese Dualvariablen für diesen (k,n), falls Struktur vorhanden
+        if ~isempty(nadirStruct)
+            % Extrahiere den gesamten Vektor der nadir_cone-Dualvariablen
+            dual_vector = dual(nadirStruct.nadir_cone);
+            % Da NadirCone 3 Dualvariablen enthält werden diese zugordnet
+            if length(dual_vector) >= 3
+                mu_dual = dual_vector(1);
+                lambda1_dual = dual_vector(2);
+                lambda2_dual = dual_vector(3);
+            else
+                % Falls der Vektor kürzer als erwartet ist
+                mu_dual = NaN;
+                lambda1_dual = NaN;
+                lambda2_dual = NaN;
+            end
+        else
+            mu_dual = NaN;
+            lambda1_dual = NaN;
+            lambda2_dual = NaN;
+        end
+        
+        % Speichere die Werte in den Arrays
+        mu_values(k, n) = mu_dual;
+        lambda1_values(k, n) = lambda1_dual;
+        lambda2_values(k, n) = lambda2_dual;
+        
+        % Ausgabe für jedes Zeit-Szenario-Paar
+        fprintf('Zeit %d, Szenario %d: mu = %f, lambda1 = %f, lambda2 = %f\n', ...
+                 k, n, mu_dual, lambda1_dual, lambda2_dual);
+    end
+end
+
+% Aufgrund der Stochastischen Natur werden die Mittelwerte aller
+% Dualvariablen gebildet
+mean_mu = mean(mu_values(:), 'omitnan');
+mean_lambda1 = mean(lambda1_values(:), 'omitnan');
+mean_lambda2 = mean(lambda2_values(:), 'omitnan');
+
+fprintf('Mittelwert von mu über alle Zeitschritte und Szenarien: %f\n', mean_mu);
+fprintf('Mittelwert von lambda1 über alle Zeitschritte und Szenarien: %f\n', mean_lambda1);
+fprintf('Mittelwert von lambda2 über alle Zeitschritte und Szenarien: %f\n', mean_lambda2);
+
+%% Hier werden die Mitterlwert der Dualvariablen zu Preisen Umgerechnet
+mu = mean_mu;
+lambda1 = -mean_lambda1;  % Vorzeichen nach Wunsch ändern
+lambda2 = -mean_lambda2;
+
+% Annahme: Wir untersuchen das erste Intervall (i = 1)
+i = 1;
+
+% Werte für Inertia_term_out, FR_term_out, und PLoss_term_out für i sollten verfügbar sein
+inertia_val = value(Inertia_term_out(i));
+fr_val = value(FR_term_out(i));
+ploss_val = value(PLoss_term_out(i));
+
+result_expression = lambda1 * (inertia_val - fr_val) + ...
+                    lambda2 * (2*sqrt(1/(4*InputData.nadir_req)) * ploss_val) - ...
+                    mu * (inertia_val + fr_val);
+%fprintf('Ergebnis des Ausdrucks: %f\n', result_expression);
+
+H_price = (mu - lambda1)/ InputData.f_0; % in €/MWs
+%PFRfast_price = (mu + lambda1) / InputData.Td(1);
+% PFR_price = (mu + lambda1) / InputData.Td(2);
+% Deloading_price = lambda2 / sqrt(InputData.nadir_req);
+
+fprintf('H_price = %f\n', H_price);
+%fprintf('PFRfast_price = %f\n', PFRfast_price);
+%fprintf('PFR_price = %f\n', PFR_price);
+%fprintf('Deloading_price = %f\n', Deloading_price);
