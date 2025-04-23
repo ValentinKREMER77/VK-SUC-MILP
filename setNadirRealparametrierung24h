@@ -1,0 +1,102 @@
+function [DV_Total_FR_atTd, Inertia_term, PLoss_term, FR_term, ...
+          Bounds_temp, constraintsStruct] = ...
+          setNadirRealparametrierung24h(InputData, FR_current, H_total, ...
+                               DV_PLoss, Bounds_temp, ...
+                               P_Wind_scenario)
+% =========================================================================
+% SetNadir stellt sicher, dass die
+% Frequenzregeungsmechnismen wirken und somit die Frequenz innerhalb der
+% Grenzwerte bleibt
+% =========================================================================
+
+
+Td          = InputData.Td; %Zeit innerhalb der die FR bereitgestellt wird
+Pmax        = InputData.Gen_limits(:,2);
+PLossMax    = InputData.DV_PLoss;
+nadir_req   = InputData.nadir_req;
+FR_capacity = InputData.fr_capacity;
+H_const     = InputData.H_const;
+H_const_Wind= InputData.H_const_Wind;
+H_const_Nuclear = InputData.H_const_Nuclear; % ist 0
+P_Wind      = P_Wind_scenario;
+num_gen     = InputData.num_gen;
+
+nTd = length(Td);
+
+% Initialisierung der Variablen
+DV_Total_FR_atTd = sdpvar(1,nTd,'full');
+Inertia_term     = sdpvar(1,nTd,'full');
+PLoss_term       = sdpvar(1,nTd,'full');
+FR_term          = sdpvar(1,nTd,'full');
+
+%% 1) Berechnung von DV_Total_FR_atTd Zeitpunktabhängig
+for i = 1:nTd
+    DV_Total_FR_atTd(i) = 0;
+    for j = 1:nTd
+        if Td(j) > Td(i)% Wenn Zeit kürzer ist wird aufskaliert
+            DV_Total_FR_atTd(i) = DV_Total_FR_atTd(i) + FR_current(j)*Td(i)/Td(j);
+        else
+            DV_Total_FR_atTd(i) = DV_Total_FR_atTd(i) + FR_current(j);% Ansonsten volle FR
+        end
+    end
+end
+
+Bounds_temp = [Bounds_temp,...
+    0 <= DV_Total_FR_atTd, ...
+    DV_Total_FR_atTd <= (num_gen'*FR_capacity)*ones(1,nTd) ];
+
+%% 2) Berechnung von Inertia_term, PLoss_term, FR_term
+for i = 1:nTd
+    Inertia_term(i) = H_total;
+    PLoss_term(i)   = DV_PLoss;
+    FR_term(i)      = 0;
+    for j = 1:nTd
+        if Td(j) < Td(i)
+            Inertia_term(i) = Inertia_term(i) - FR_current(j)*Td(j)/(4*nadir_req);
+            PLoss_term(i) = PLoss_term(i) - FR_current(j);
+        else
+            FR_term(i) = FR_term(i) + FR_current(j)/Td(j);
+        end
+    end
+end
+
+UpperBound_FR_term = (num_gen'*(FR_capacity./Td)) * ones(1,nTd);
+Bounds_temp = [Bounds_temp, 0 <= FR_term <= UpperBound_FR_term];
+
+UpperBound_Inertia_term = ((num_gen.*H_const)'*Pmax)/InputData.f_0 + ...
+                          (H_const_Wind*P_Wind)/InputData.f_0 + ...
+                          (H_const_Nuclear*PLossMax)/InputData.f_0;
+UpperBound_Inertia_term = UpperBound_Inertia_term * ones(1,nTd);
+
+LowerBound_Inertia_term = - num_gen'*(FR_capacity.*Td/(4*nadir_req));
+LowerBound_Inertia_term = LowerBound_Inertia_term * ones(1,nTd);
+
+LowerBound_PLoss_term = (PLossMax - num_gen'*FR_capacity);
+LowerBound_PLoss_term = LowerBound_PLoss_term * ones(1,nTd);
+
+Bounds_temp = [Bounds_temp,...
+    LowerBound_Inertia_term <= Inertia_term <= UpperBound_Inertia_term,...
+    LowerBound_PLoss_term <= PLoss_term <= PLossMax*ones(1,nTd)];
+
+%% 3) Aufteilung der Nadir-Nebenbedingungen für i=1
+tol = 0.01;
+i = 1;  % Arbeiten für erstes Intervall
+
+constraintsStruct = struct();
+constraintsStruct.limits = (DV_Total_FR_atTd(i) >= DV_PLoss - tol);
+constraintsStruct.nadir_cone = cone([Inertia_term(i) - FR_term(i); ...
+                                    2*sqrt(1/(4*nadir_req))*PLoss_term(i)], ...
+                                   Inertia_term(i) + FR_term(i));
+constraintsStruct.nadir_inertia_pos = (Inertia_term(i) >= 0);
+constraintsStruct.nadir_fr_pos = (FR_term(i) >= 0);
+
+% Alle Nadir-bezogenen Constraints zusammenfassen
+constraintsStruct.all = [ constraintsStruct.limits, ...
+                          constraintsStruct.nadir_cone, ...
+                          constraintsStruct.nadir_inertia_pos, ...
+                          constraintsStruct.nadir_fr_pos ];
+
+
+
+
+end
